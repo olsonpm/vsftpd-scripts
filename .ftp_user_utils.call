@@ -1,0 +1,267 @@
+#!/bin/bash
+
+#------#
+# Init #
+#------#
+
+set -e
+
+
+#---------#
+# Imports #
+#---------#
+
+if [ -z "${IMPORT_SRC+x}" ]; then
+    source "${LIBRARY_FXNS}/import"
+fi
+import "log"
+import "file_exists"
+import "/ftp/scripts/ftp_user_utils"
+
+log 1 "entering .ftp_user_utils.call"
+
+
+#------------------#
+# Helper Functions #
+#------------------#
+
+usage ()
+{
+    out=$1
+    printf "\nUsage: ./.ftp_users_utils.call\n" >&$out
+    printf "       [-r|--rm-users \"&<user>\"]\n" >&$out
+    printf "       [-e|--rm-users-file <file>]\n" >&$out
+    printf "       [-x|--rm-all-users]\n" >&$out
+    printf "       [-a|--add-user \"<user> <password> &<group>\"]\n" >&$out
+    printf "       [-d|--add-users-file <file>]\n" >&$out
+    printf "       [-m|--modify-password \"<username> <new password>\"]\n" >&$out
+    printf "       [-o|--modify-passwords-file <file>]\n" >&$out
+    printf "       [-g|--add-group \"<username> &<group>\"]\n" >&$out
+    printf "       [-p|--rm-group \"<username> &<group>\"]\n" >&$out
+    printf "       [-l|--print-users\n" >&$out
+    printf "       [-h|--help]\n\n" >&$out
+    printf "[-e|--remove-users-file <file>]: <file> must be in the format:\n<user1>\n<user2>\n...\n\n" >&$out
+    printf "[-d|--add-users-file <file>]: <file> must be in the format:\n<user1> <password1> &<group>\n<user2> <password2> &<group>\n...\n\n" >&$out
+    printf "[-o|--modify-passwords-file <file>]: <file> must be in the format:\n<user1> <password1>\n<user2> <password2>\n...\n\n" >&$out
+    printf "Notes\n"
+    printf " - Script must be ran with root permissions\n\n" >&$out
+}
+
+__rm_users () {
+    for u in ${@}; do
+	ftpu_remove_user "${u}"
+    done
+}
+
+__rm_users_file () {
+    local file="${1}"
+    if ! file_exists "${file}"; then
+	log 5 "file '${file}' doesn't exist"
+	exit 1
+    fi
+
+    ftpu_parse_rm_file "${file}"
+}
+
+__rm_all_users () {
+    local users=$(ls "/ftp/users/")
+    for u in ${users[@]}; do
+	ftpu_remove_user "${u}"
+    done
+}
+
+__add_user () {
+    local username="${1}"
+    local password="${2}"
+    shift;shift
+    ftpu_add_user "${username}" "${password}" ${@}
+}
+
+__add_users_file () {
+    local file="${1}"
+    if ! file_exists "${file}"; then
+	log 5 "file '${file}' doesn't exist"
+	exit 1
+    fi
+
+    ftpu_parse_add_file "${file}"
+}
+
+__modify_user_pass () {
+    local username="${1}"
+    local password="${2}"
+    ftpu_change_password "${username}" "${password}"
+}
+
+__modify_user_pass_file () {
+    local file="${1}"
+    if ! file_exists "${file}"; then
+	log 5 "file '${file}' doesn't exist"
+	exit 1
+    fi
+    ftpu_parse_pass_file "${file}"
+}
+
+__add_user_to_group () {
+    local username="${1}"; shift
+    for g in ${@}; do
+	ftpu_add_user_to_group "${username}" "${g}"
+    done
+}
+
+__rm_user_from_group () {
+    local username="${1}"; shift
+    for g in ${@}; do
+	ftpu_rm_user_from_group "${username}" "${g}"
+    done
+}
+
+__print_all_users () {
+    local users=$(ls "/ftp/users/")
+    for u in ${users[@]}; do
+	ftpu_print_user "${u}"
+    done
+}
+
+
+#------#
+# Main #
+#------#
+
+if [ "$#" = 0 ]; then
+    log 5 "This command needs at least one argument"
+    usage 2
+    exit 1
+elif [ ${EUID} -ne 0 ]; then
+    log 5 "This script must be run as root (keep environment vars with -E)"
+    exit 1
+fi
+
+while getopts ":hr:e:xa:d:m:o:g:p:l-:" opt; do
+    case "${opt}" in
+	-)
+	    case "${OPTARG}" in
+		rm-users)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __rm_users ${val}
+		    ;;
+	        rm-users-file)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __rm_users_file "${val}"
+		    ;;
+		rm-all-users)
+		    OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}'"
+		    __rm_all_users
+		    ;;
+		add-users)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __add_user ${val}
+		    ;;
+		add-users-file)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __add_users_file "${val}"
+		    ;;
+		modify-password)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __modify_user_pass ${val}
+		    ;;
+		modify-passwords-file)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __modify_user_pass_file "${val}"
+		    ;;
+		add-group)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __add_user_to_group ${val}
+		    ;;
+		rm-group)
+		    val="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}', value: '${val}'"
+		    __rm_user_from_group ${val}
+		    ;;
+		print-users)
+		    OPTIND=$(( ${OPTIND} + 1 ))
+		    log 1 "parsing option: '--${OPTARG}'"
+		    __print_all_users
+		    ;;
+		"help")
+		    usage 1
+		    exit 0
+		    ;;
+		*)
+		    log 5 "Unknown option '--${OPTARG}' - exiting"
+		    exit 1
+		    ;;
+	    esac
+	    ;;
+	r)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __rm_users ${OPTARG}
+	    ;;
+	e)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __rm_users_file "${OPTARG}"
+	    ;;
+	x)
+	    log 1 "parsing option '-${opt}'"
+	    __rm_all_users 
+	    ;;
+	a)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __add_user ${OPTARG}
+	    ;;
+	d)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __add_users_file "${OPTARG}"
+	    ;;
+	m)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __modify_user_pass ${OPTARG}
+	    ;;
+	o)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __modify_user_pass_file "${OPTARG}"
+	    ;;
+	g)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __add_user_to_group ${OPTARG}
+	    ;;
+	p)
+	    log 1 "parsing option '-${opt}' with value: '${OPTARG}'"
+	    __rm_user_from_group ${OPTARG}
+	    ;;
+	l)
+	    log 1 "parsing option '-${opt}'"
+	    __print_all_users
+	    ;;
+	h)
+	    usage 1
+	    exit 0
+	    ;;
+	\?)
+	    log 5 "Invalid option given: -${OPTARG}"
+	    usage 2
+	    exit 1
+	    ;;
+	:)
+	    log 5 "Option -${OPTARG} requires an argument"
+	    usage 2
+	    exit 2
+	    ;;  
+	*)
+	    log 5 "Invalid option given: -${OPTARG}"
+	    usage 2
+	    exit 1
+	    ;;
+    esac
+done
+
+
+log 1 "exiting .ftp_user_utils.call"

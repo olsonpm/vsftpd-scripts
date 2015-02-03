@@ -1,0 +1,355 @@
+#!/bin/bash
+
+#------#
+# Init #
+#------#
+
+FTP_USER_UTILS_SRC=
+
+
+#---------#
+# Imports #
+#---------#
+
+if [ -z "${LOG_SRC+x}" ]; then
+    source "${LIBRARY_FXNS}/import"
+fi
+import "log"
+
+log 1 "entering ftp_users_utils"
+
+
+#-----#
+# API #
+#-----#
+
+#-------------------------------
+#
+# Function: ftpu_add_user <username> <password> &[group]
+#
+# Arguments:
+#   <username> - User to add
+#   <password> - Corresponding password
+#   &[group] - Groups which user will be added to
+#
+# Description: Adds a user to the ftp users directory, adds the virtual user to the postgres database, adds
+#                the vsftpd user conf to the user conf directory, then if any groups are specified, adds
+#                the vsftpd user to those groups via ftpu_add_user_to_group.
+#
+#-------------------------------
+#
+# Function: ftpu_parse_add_file <file>
+#
+# Arguments:
+#   <file> - File containing list of users formatted like:
+#              <username1> <password1> &[group]
+#              <username2> <password2> &[group]
+#              ...
+#
+# Description: Reads the file line by line, first verifies at least two arguments before feading the input
+#                into ftpu_add_user.  No other verifications are made (i.e. bad username/pass/groups
+#                will not be caught by this method)
+#
+#-------------------------------
+#
+# Function: ftpu_remove_user <username>
+#
+# Arguments:
+#   <username> - User to remove
+#
+# Description: The following steps are performed when removing a user:
+#                1) Removes the virtual user's postgres entry
+#                2) Removes user from the group via ftpu_remove_user_from_group
+#                3) Removes the vsftpd user-conf file
+#                4) Finally removes the ftp user dir
+#
+#-------------------------------
+#
+# Function: ftpu_parse_rm_file <file>
+#
+# Arguments:
+#   <file> - File containing list of users formatted like:
+#              <username1>
+#              <username2>
+#              ...
+#
+# Description: Reads the file line by line, first verifies only one argument before feading the input
+#                into ftpu_add_user.  No other verifications are made (i.e. bad username will not be
+#                caught by this method)
+#                
+#-------------------------------
+#
+# Function: ftpu_change_password <username> <new password>
+#
+# Arguments:
+#   <username> - User whose password to change
+#   <new password> - New password
+#
+# Description: Modifies a single virtual user's password via psql
+#
+#-------------------------------
+#
+# Function: ftpu_parse_pass_file <file>
+#
+# Arguments:
+#   <file> - File containing list of users with corresponding new passwords, formatted like:
+#              <username1> <password1>
+#              <username2> <password2>
+#              ...
+#
+# Description: Reads the file line by line, loosely validating the lines while logging warnings and continuing
+#                if an invalid line is found.  Passes valid lines to ftpu_change_password
+#
+#-------------------------------
+#
+# Function: ftpu_add_user_to_group <username> <group>
+#
+# Arguments:
+#   <username> - User to be added to the grouop
+#   <group> - Low and behold, the group name
+#
+# Description: Makes all the necessary modifications to add the user to the group. Those include:
+#                1) Add the username to the ftp user-group file, creating the file if the group didn't exist
+#                2) Mount the group-shared directory (again, create if it doesn't exist) inside the
+#                     user's ftp dir.
+#
+#-------------------------------
+#
+# Function: ftpu_rm_user_from_group <username> <group>
+#
+# Arguments:
+#   <username> - User to be removed from given group
+#   <group> - All praise, the group name
+#
+# Description: Makes all the necessary modifications to remove the user from the group.  Thses include:
+#                1) Unmounts all the group directories
+#                2) Removes own username from user-group files indicating which groups he belonged to -
+#                     If he was the only user in that group, the file is deleted along with the group
+#                     shared dir.
+#
+#-------------------------------
+#
+# Function: ftpu_print_user <username>
+#
+# Arguments:
+#   <username> - User to print out
+#
+# Description: This function will list the username along with all the groups it belongs to on a single line
+#
+#-------------------------------
+
+
+#------------------#
+# Script Variables #
+#------------------#
+
+FTPU_DB="vsftpd"
+
+
+#-----------#
+# Functions #
+#-----------#
+
+ftpu_add_user ()
+{
+    local username="$1"
+    local password="$2"
+    shift; shift
+    log 1 "user: $username\n  pass: ${password//%/%%}\n  groups: ${*}"
+    
+    if [ -e "/ftp/users/${username}" ]; then
+	log 4 "$group member $username already exists - skipping"
+	return
+    fi
+
+    # duplicating all single quotes in order to escape them for psql
+    password="${password//\'/\'\'}"
+    sudo -u phil psql -d "${FTPU_DB}" -c "INSERT INTO vsftpd_user (user_name, user_password) VALUES ('${username}', crypt('${password}', gen_salt('bf', 8)));"
+
+    mkdir -m 755 /ftp/users/"${username}"
+    mkdir -m 775 /ftp/users/"${username}"/private
+    chown -R root:vsftpd-virtual /ftp/users/"${username}"
+
+    # add to groups
+    for g in ${@}; do
+	ftpu_add_user_to_group "${username}" "${g}"
+    done
+    
+    # create vsftpd user-config
+    printf "write_enable=YES\nlocal_root=/ftp/users/${username}\n" > /etc/vsftpd.d/user-config/"${username}"
+}
+
+ftpu_parse_add_file ()
+{
+    local file="$1"
+
+    log 3 "file: ${file}"
+    
+    while read -r line || [ -n "${line}" ]; do
+	if [ "${line}" = "" ]; then
+	    log 4 "Blank line - skipping."
+	else
+	    ftpu_add_user ${line}
+	fi
+    done < "${file}"
+}
+
+ftpu_remove_user ()
+{
+    local username="$1"
+
+    if [ ! -d /ftp/users/"${username}" ]; then
+	log 4 "User ${username} doesn't exist - skipping"
+	return
+    fi
+
+    log 3 "removing ${username}"
+    sudo -u phil psql "${FTPU_DB}" -c "DELETE FROM vsftpd_user where user_name = '${username}'"
+
+    # get all files indicating what groups this user belongs to
+    local  groupFiles=($(grep -rlx "${username}" "/ftp/user-groups"))
+
+    for g in ${groupFiles[@]}; do
+	
+	# basename of the file will correspond to the group name
+	local group="$(basename ${g})"
+	ftpu_rm_user_from_group "${username}" "${group}"
+    done
+
+    # remove user-config file along with the ftp user dir
+    rm "/etc/vsftpd.d/user-config/${username}"
+    rm -fr "/ftp/users/${username}"
+}
+
+ftpu_parse_rm_file ()
+{
+    local file="$1"
+    log 3 "file: ${file}"
+
+    while read -r line || [ -n "${line}" ]
+    do
+	if [ "${line}" = "" ]; then
+	    log 4 "empty line - skipping"
+	    continue
+	else
+	    local tmp=(${line})
+	    if [ "${tmp[1]}" != "" ]; then
+		log 5 "usernames cannot contain spaces"
+		usage 2
+		exit 1
+	    fi
+	fi
+	
+	ftpu_remove_user "${line}"
+    done < "${file}"
+}
+
+ftpu_change_password ()
+{
+    local username="$1"
+    local password="$2"
+
+    log 1 "username: ${username}\n  pass: ${password//%/%%}\n"
+    
+    # escape single quotes
+    password="${password//\'/\'\'}"
+    
+    sudo -u phil psql -d "${FTPU_DB}" -c "UPDATE vsftpd_user set user_password = crypt('${password}', gen_salt('bf', 8)) WHERE user_name = '${username}';"
+}
+
+ftpu_parse_pass_file ()
+{
+    local file="$1"
+    log 3 "file: ${file}"
+
+    while read -r line || [ -n "${line}" ]
+    do
+	# validate file lines
+	if [ "${line}" = "" ]; then
+	    log 4 "empty line - skipping"
+	    continue
+	else
+	    local tmp=(${line})
+	    if [ "${tmp[2]}" != "" ]; then
+		log 4 "invalid line: '${tmp[*]}' - skipping"
+		continue
+	    fi
+	fi
+	
+	local username="${tmp[0]}"
+	local password="${tmp[1]}"
+	ftpu_change_password "${username}" "${password}"
+    done < "${file}"
+}
+
+ftpu_add_user_to_group () {
+    local username="${1}"; shift
+    local groups=${@}
+    for group in ${groups[@]}; do
+	log 2 "Adding user ${username} to group ${group}"
+	local groupDir="/ftp/groups-shared/${group}"
+	local ugroupDir="/ftp/user-groups/${group}"
+	if [ ! -d "${groupDir}" ]; then
+	    log 1 "groupDir: ${groupDir} doesn't exist - creating."
+	    mkdir -m 1775 "${groupDir}"
+	    mkdir -m 755 "${groupDir}/read-only"
+	    printf "${username}\n" > "${ugroupDir}"
+	else
+	    log 1 "groupDir: ${groupDir} _does_ exist."
+	    printf "${username}\n" >> "${ugroupDir}"
+	fi
+	mkdir -m 775 "/ftp/users/${username}/${group}"
+	chown root:vsftpd-virtual "/ftp/users/${username}/${group}"
+	chown -R root:vsftpd-virtual "${groupDir}"
+	chown -R root:vsftpd-virtual "${groupDir}/read-only"
+	mount -B "${groupDir}" "/ftp/users/${username}/${group}"
+	shift
+    done
+}
+
+ftpu_rm_user_from_group () {
+    local username="${1}"
+    local group="${2}"
+
+    if [ $(grep -c "${username}" "/ftp/user-groups/${group}") = 0 ]; then
+	log 5 "user '${username}' doesn't belong to group '${group}' - skipping"
+	return
+    fi
+    
+    if [ ! -d "/ftp/users/${username}/${group}" ]; then
+	log 4 "group '${group}' not mounted in ${username}'s ftp directory.  Skipping unmount step."
+    else
+	log 3 "unmounting and removing /ftp/users/${username}/${group}"
+	umount "/ftp/users/${username}/${group}"
+	rm -rf "/ftp/users/${username}/${group}"
+    fi
+
+    # removing username from user-group file
+    sed -i "/${username}/d" "/ftp/user-groups/${group}" 1>/dev/null
+
+    # testing to see if there is only white space left in the file (indicating no other users
+    #   belong to this group
+    local noWhite="$(sed -r s/[[:space:]]+//g /ftp/user-groups/${group})"
+    if [ "${noWhite}" = "" ]; then
+	log 3 "no more members in group '${group}' - removing file and shared dir."
+	rm "/ftp/user-groups/${group}"
+	rm -rf "/ftp/groups-shared/${group}"
+    fi
+}
+
+ftpu_print_user () {
+    local username="${1}"
+    local groups=
+
+    local  groupFiles=($(grep -rlx "${username}" "/ftp/user-groups"))
+    
+    for g in ${groupFiles[@]}; do
+	
+	# basename of the file will correspond to the group name
+	groups="${groups} $(basename ${g})"
+    done
+
+    printf "user: ${username}\ngroups: ${groups}\n\n" >&1
+}
+
+log 1 "exiting ftp_users_utils"
